@@ -33,6 +33,7 @@ import (
 	kubesecrets "istio.io/istio/pilot/pkg/credentials/kube"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model/credentials"
+	"istio.io/istio/pilot/pkg/model/kstatus"
 	"istio.io/istio/pilot/pkg/status"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config"
@@ -42,7 +43,6 @@ import (
 	schematypes "istio.io/istio/pkg/config/schema/kubetypes"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
-	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
@@ -297,16 +297,14 @@ func BackendTLSPolicyCollection(
 		tls := &networking.ClientTLSSettings{Mode: networking.ClientTLSSettings_SIMPLE}
 		s := i.Spec
 
-		conds := map[string]*condition{
-			string(gw.PolicyConditionAccepted): {
-				reason:  string(gw.PolicyReasonAccepted),
-				message: "Configuration is valid",
-			},
-			string(gw.BackendTLSPolicyConditionResolvedRefs): {
-				reason:  string(gw.BackendTLSPolicyReasonResolvedRefs),
-				message: "Configuration is valid",
-			},
-		}
+		baseConds := kstatus.NewPolicyConditionSet(
+			kstatus.PolicyAcceptedReason(gw.PolicyReasonAccepted),
+			"Configuration is valid",
+		)
+		baseConds.EnableResolvedRefs(
+			kstatus.BackendTLSResolvedRefsReason(gw.BackendTLSPolicyReasonResolvedRefs),
+			"Configuration is valid",
+		)
 		tls.Sni = string(s.Validation.Hostname)
 		tls.SubjectAltNames = slices.MapFilter(s.Validation.SubjectAltNames, func(e gw.SubjectAltName) *string {
 			switch e.Type {
@@ -317,7 +315,20 @@ func BackendTLSPolicyCollection(
 			}
 			return nil
 		})
-		tls.CredentialName = getBackendTLSCredentialName(ctx, s.Validation, i.Namespace, conds, references)
+		credName, credErr := getBackendTLSCredentialName(ctx, s.Validation, i.Namespace, references)
+		tls.CredentialName = credName
+		if credErr != nil {
+			if credErr.acceptedErr != nil {
+				baseConds.SetAcceptedError(credErr.acceptedErr.reason, credErr.acceptedErr.message)
+			}
+			if credErr.resolvedRefsErr != nil {
+				baseConds.SetResolvedRefsError(credErr.resolvedRefsErr.reason, credErr.resolvedRefsErr.message)
+			}
+			if credErr.acceptedMsgAppend != "" {
+				baseConds.AppendAcceptedMessage(credErr.acceptedMsgAppend)
+			}
+		}
+		conds := baseConds
 
 		// In ancestor status, we need to report for Service (for mesh) and for each relevant Gateway.
 		// However, there is a max of 16 items we can report.
@@ -328,7 +339,7 @@ func BackendTLSPolicyCollection(
 		ancestorStatus := make([]gw.PolicyAncestorStatus, 0, len(i.Spec.TargetRefs))
 		uniqueGateways := sets.New[types.NamespacedName]()
 		for idx, t := range i.Spec.TargetRefs {
-			conds = maps.Clone(conds)
+			iterConds := conds // copy value (struct copy)
 			refo, err := references.LocalPolicyTargetRef(ctx, t.LocalPolicyTargetReference, i.Namespace)
 			var sectionName *string
 			if err == nil {
@@ -366,10 +377,10 @@ func BackendTLSPolicyCollection(
 				}
 			}
 			if err != nil {
-				conds[string(gw.PolicyConditionAccepted)].error = &ConfigError{
-					Reason:  string(gw.PolicyReasonTargetNotFound),
-					Message: "targetRefs invalid: " + err.Error(),
-				}
+				iterConds.SetAcceptedError(
+					kstatus.PolicyAcceptedReason(gw.PolicyReasonTargetNotFound),
+					"targetRefs invalid: "+err.Error(),
+				)
 			} else {
 				targetKind := gvk.MustToKind(schematypes.GvkFromObject(refo.(controllers.Object)))
 				target := TypedNamespacedName{
@@ -416,7 +427,7 @@ func BackendTLSPolicyCollection(
 				Name:        t.Name,
 				SectionName: t.SectionName,
 			}
-			ancestorStatus = append(ancestorStatus, setAncestorStatus(meshPR, status, i.Generation, conds, constants.ManagedGatewayMeshController))
+			ancestorStatus = append(ancestorStatus, setAncestorStatus(meshPR, status, i.Generation, &iterConds, constants.ManagedGatewayMeshController))
 		}
 		gwl := slices.SortBy(uniqueGateways.UnsortedList(), types.NamespacedName.String)
 		for _, g := range gwl {
@@ -425,41 +436,62 @@ func BackendTLSPolicyCollection(
 				Kind:  ptr.Of(gw.Kind(gvk.KubernetesGateway.Kind)),
 				Name:  gw.ObjectName(g.Name),
 			}
-			ancestorStatus = append(ancestorStatus, setAncestorStatus(pr, status, i.Generation, conds, gw.GatewayController(features.ManagedGatewayController)))
+			ancestorStatus = append(ancestorStatus, setAncestorStatus(pr, status, i.Generation, &conds, gw.GatewayController(features.ManagedGatewayController)))
 		}
 		status.Ancestors = mergeAncestors(status.Ancestors, ancestorStatus)
 		return status, res
 	}, opts.WithName("BackendTLSPolicy")...)
 }
 
+// backendTLSCredError carries typed condition errors produced by getBackendTLSCredentialName.
+type backendTLSCredError struct {
+	// acceptedErr, if non-nil, sets the Accepted condition error.
+	acceptedErr *struct {
+		reason  kstatus.PolicyAcceptedReason
+		message string
+	}
+	// resolvedRefsErr, if non-nil, sets the ResolvedRefs condition error.
+	resolvedRefsErr *struct {
+		reason  kstatus.BackendTLSResolvedRefsReason
+		message string
+	}
+	// acceptedMsgAppend, if non-empty, is appended to the Accepted condition success message.
+	acceptedMsgAppend string
+}
+
 func getBackendTLSCredentialName(
 	ctx krt.HandlerContext,
 	validation gw.BackendTLSPolicyValidation,
 	policyNamespace string,
-	conds map[string]*condition,
 	references *gatewaycommon.ReferenceSet,
-) string {
+) (string, *backendTLSCredError) {
 	if wk := validation.WellKnownCACertificates; wk != nil {
 		switch *wk {
 		case gw.WellKnownCACertificatesSystem:
 			// Already our default, no action needed
 		default:
-			conds[string(gw.PolicyConditionAccepted)].error = &ConfigError{
-				Reason:  string(gw.PolicyReasonInvalid),
-				Message: fmt.Sprintf("Unknown wellKnownCACertificates: %v", *wk),
+			return "", &backendTLSCredError{
+				acceptedErr: &struct {
+					reason  kstatus.PolicyAcceptedReason
+					message string
+				}{
+					reason:  kstatus.PolicyAcceptedReason(gw.PolicyReasonInvalid),
+					message: fmt.Sprintf("Unknown wellKnownCACertificates: %v", *wk),
+				},
 			}
 		}
-		return ""
+		return "", nil
 	}
 	if len(validation.CACertificateRefs) == 0 {
-		return ""
+		return "", nil
 	}
 
 	// Spec should require but double check
 	// We only support 1
 	ref := validation.CACertificateRefs[0]
+	var result backendTLSCredError
 	if len(validation.CACertificateRefs) > 1 {
-		conds[string(gw.PolicyConditionAccepted)].message += "; warning: only the first caCertificateRefs will be used"
+		result.acceptedMsgAppend = "; warning: only the first caCertificateRefs will be used"
 	}
 	refo, err := references.LocalPolicyRef(ctx, ref, policyNamespace)
 	if err == nil {
@@ -467,12 +499,18 @@ func getBackendTLSCredentialName(
 		case *v1.ConfigMap:
 			if _, rerr := kubesecrets.ExtractRootFromString(to.Data); rerr != nil {
 				err = rerr
-				conds[string(gw.BackendTLSPolicyReasonResolvedRefs)].error = &ConfigError{
-					Reason:  string(gw.BackendTLSPolicyReasonInvalidCACertificateRef),
-					Message: "Certificate invalid: " + err.Error(),
+				result.resolvedRefsErr = &struct {
+					reason  kstatus.BackendTLSResolvedRefsReason
+					message string
+				}{
+					reason:  kstatus.BackendTLSResolvedRefsReason(gw.BackendTLSPolicyReasonInvalidCACertificateRef),
+					message: "Certificate invalid: " + err.Error(),
 				}
 			} else {
-				return credentials.KubernetesConfigMapTypeURI + policyNamespace + "/" + string(ref.Name)
+				if result.acceptedMsgAppend != "" {
+					return credentials.KubernetesConfigMapTypeURI + policyNamespace + "/" + string(ref.Name), &result
+				}
+				return credentials.KubernetesConfigMapTypeURI + policyNamespace + "/" + string(ref.Name), nil
 			}
 		// TODO: for now we do not support Secret references.
 		// Core requires only ConfigMap
@@ -481,34 +519,49 @@ func getBackendTLSCredentialName(
 		// Additionally, we will need to ensure we don't accidentally authorize them to access the private key, just the ca.crt
 		default:
 			err = fmt.Errorf("unsupported reference kind: %v", ref.Kind)
-			conds[string(gw.BackendTLSPolicyReasonResolvedRefs)].error = &ConfigError{
-				Reason:  string(gw.BackendTLSPolicyReasonInvalidKind),
-				Message: "Certificate reference invalid: " + err.Error(),
+			result.resolvedRefsErr = &struct {
+				reason  kstatus.BackendTLSResolvedRefsReason
+				message string
+			}{
+				reason:  kstatus.BackendTLSResolvedRefsReason(gw.BackendTLSPolicyReasonInvalidKind),
+				message: "Certificate reference invalid: " + err.Error(),
 			}
 		}
 	} else {
 		if strings.Contains(err.Error(), "unsupported kind") {
-			conds[string(gw.BackendTLSPolicyReasonResolvedRefs)].error = &ConfigError{
-				Reason:  string(gw.BackendTLSPolicyReasonInvalidKind),
-				Message: "Certificate reference not supported: " + err.Error(),
+			result.resolvedRefsErr = &struct {
+				reason  kstatus.BackendTLSResolvedRefsReason
+				message string
+			}{
+				reason:  kstatus.BackendTLSResolvedRefsReason(gw.BackendTLSPolicyReasonInvalidKind),
+				message: "Certificate reference not supported: " + err.Error(),
 			}
 		} else {
-			conds[string(gw.BackendTLSPolicyReasonResolvedRefs)].error = &ConfigError{
-				Reason:  string(gw.BackendTLSPolicyReasonInvalidCACertificateRef),
-				Message: "Certificate reference not found: " + err.Error(),
+			result.resolvedRefsErr = &struct {
+				reason  kstatus.BackendTLSResolvedRefsReason
+				message string
+			}{
+				reason:  kstatus.BackendTLSResolvedRefsReason(gw.BackendTLSPolicyReasonInvalidCACertificateRef),
+				message: "Certificate reference not found: " + err.Error(),
 			}
 		}
 	}
 	if err != nil {
-		conds[string(gw.PolicyConditionAccepted)].error = &ConfigError{
-			Reason:  string(gw.BackendTLSPolicyReasonNoValidCACertificate),
-			Message: "Certificate reference invalid: " + err.Error(),
+		result.acceptedErr = &struct {
+			reason  kstatus.PolicyAcceptedReason
+			message string
+		}{
+			reason:  kstatus.PolicyAcceptedReason(gw.BackendTLSPolicyReasonNoValidCACertificate),
+			message: "Certificate reference invalid: " + err.Error(),
 		}
 		// Generate an invalid reference. This ensures traffic is blocked.
 		// See https://github.com/kubernetes-sigs/gateway-api/issues/3516 for upstream clarification on desired behavior here.
-		return credentials.InvalidSecretTypeURI
+		return credentials.InvalidSecretTypeURI, &result
 	}
-	return ""
+	if result.acceptedMsgAppend != "" {
+		return "", &result
+	}
+	return "", nil
 }
 
 func BackendTrafficPolicyCollection(
@@ -528,12 +581,10 @@ func BackendTrafficPolicyCollection(
 		lb := &networking.LoadBalancerSettings{}
 		var retryBudget *networking.TrafficPolicy_RetryBudget
 
-		conds := map[string]*condition{
-			string(gw.PolicyConditionAccepted): {
-				reason:  string(gw.PolicyReasonAccepted),
-				message: "Configuration is valid",
-			},
-		}
+		baseConds := kstatus.NewPolicyConditionSet(
+			kstatus.PolicyAcceptedReason(gw.PolicyReasonAccepted),
+			"Configuration is valid",
+		)
 		var unsupported []string
 		// TODO(https://github.com/istio/istio/issues/55839): implement i.Spec.SessionPersistence.
 		// This will need to map into a StatefulSession filter which Istio doesn't currently support on DestinationRule
@@ -553,11 +604,15 @@ func BackendTrafficPolicyCollection(
 		}
 		if len(unsupported) > 0 {
 			msg := fmt.Sprintf("Configuration is valid, but Istio does not support the following fields: %v", humanReadableJoin(unsupported))
-			conds[string(gw.PolicyConditionAccepted)].message = msg
+			// Re-create with updated message
+			baseConds = kstatus.NewPolicyConditionSet(
+				kstatus.PolicyAcceptedReason(gw.PolicyReasonAccepted),
+				msg,
+			)
 		}
 
 		for idx, t := range i.Spec.TargetRefs {
-			conds = maps.Clone(conds)
+			iterConds := baseConds // struct copy per iteration
 			refo, err := references.XLocalPolicyTargetRef(ctx, t, i.Namespace)
 			if err == nil {
 				switch refo.(type) {
@@ -567,10 +622,10 @@ func BackendTrafficPolicyCollection(
 				}
 			}
 			if err != nil {
-				conds[string(gw.PolicyConditionAccepted)].error = &ConfigError{
-					Reason:  string(gw.PolicyReasonTargetNotFound),
-					Message: "targetRefs invalid: " + err.Error(),
-				}
+				iterConds.SetAcceptedError(
+					kstatus.PolicyAcceptedReason(gw.PolicyReasonTargetNotFound),
+					"targetRefs invalid: "+err.Error(),
+				)
 			} else {
 				// Only create an object if we can resolve the target
 				res = append(res, BackendPolicy{
@@ -599,7 +654,7 @@ func BackendTrafficPolicyCollection(
 				Kind:  &t.Kind,
 				Name:  t.Name,
 			}
-			ancestors = append(ancestors, setAncestorStatus(pr, status, i.Generation, conds, constants.ManagedGatewayMeshController))
+			ancestors = append(ancestors, setAncestorStatus(pr, status, i.Generation, &iterConds, constants.ManagedGatewayMeshController))
 		}
 		status.Ancestors = mergeAncestors(status.Ancestors, ancestors)
 		return status, res
@@ -610,7 +665,7 @@ func setAncestorStatus(
 	pr gw.ParentReference,
 	status *gw.PolicyStatus,
 	generation int64,
-	conds map[string]*condition,
+	conds *kstatus.PolicyConditionSet,
 	controller gw.GatewayController,
 ) gw.PolicyAncestorStatus {
 	currentAncestor := slices.FindFunc(status.Ancestors, func(ex gw.PolicyAncestorStatus) bool {
@@ -623,7 +678,7 @@ func setAncestorStatus(
 	return gw.PolicyAncestorStatus{
 		AncestorRef:    pr,
 		ControllerName: controller,
-		Conditions:     setConditions(generation, currentConds, conds),
+		Conditions:     conds.Build(generation, currentConds),
 	}
 }
 

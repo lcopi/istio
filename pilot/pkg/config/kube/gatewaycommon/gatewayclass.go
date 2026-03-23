@@ -111,13 +111,10 @@ func GetClassStatus(existing *k8sv1.GatewayClassStatus, gen int64) *k8sv1.Gatewa
 	if existing == nil {
 		existing = &k8sv1.GatewayClassStatus{}
 	}
-	existing.Conditions = kstatus.UpdateConditionIfChanged(existing.Conditions, metav1.Condition{
-		Type:               string(k8sv1.GatewayClassConditionStatusAccepted),
-		Status:             kstatus.StatusTrue,
-		ObservedGeneration: gen,
-		LastTransitionTime: metav1.Now(),
-		Reason:             string(k8sv1.GatewayClassConditionStatusAccepted),
-		Message:            "Handled by Istio controller",
-	})
+	conds := kstatus.NewGatewayClassConditionSet(
+		kstatus.GatewayClassAcceptedReason(k8sv1.GatewayClassConditionStatusAccepted),
+		"Handled by Istio controller",
+	)
+	existing.Conditions = conds.Build(gen, existing.Conditions)
 	return existing
 }

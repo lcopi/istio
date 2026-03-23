@@ -29,6 +29,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"istio.io/istio/pilot/pkg/config/kube/gatewaycommon"
+	"istio.io/istio/pilot/pkg/model/kstatus"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube"
@@ -325,7 +326,15 @@ func calculateSingleParentStatus(
 	// Calculate ResolvedRefs status
 	resolvedRefsStatus := calculateResolvedRefsStatus(pool, services)
 
-	// Build the final status
+	// Build the final status using InferencePoolConditionSet
+	ipConds := kstatus.NewInferencePoolConditionSet(
+		kstatus.InferencePoolAcceptedReason(acceptedStatus.reason),
+		acceptedStatus.status,
+		acceptedStatus.message,
+		kstatus.InferencePoolResolvedRefsReason(resolvedRefsStatus.reason),
+		resolvedRefsStatus.status,
+		resolvedRefsStatus.message,
+	)
 	return inferencev1.ParentStatus{
 		ParentRef: inferencev1.ParentReference{
 			Group:     (*inferencev1.Group)(&gvk.Gateway.Group),
@@ -333,10 +342,7 @@ func calculateSingleParentStatus(
 			Namespace: inferencev1.Namespace(gatewayParent.Namespace),
 			Name:      inferencev1.ObjectName(gatewayParent.Name),
 		},
-		Conditions: setConditions(pool.Generation, filteredConditions, map[string]*condition{
-			string(inferencev1.InferencePoolConditionAccepted):     acceptedStatus,
-			string(inferencev1.InferencePoolConditionResolvedRefs): resolvedRefsStatus,
-		}),
+		Conditions: ipConds.Build(pool.Generation, filteredConditions),
 	}
 }
 

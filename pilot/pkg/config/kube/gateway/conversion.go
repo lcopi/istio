@@ -1719,25 +1719,22 @@ func reportGatewayStatus(
 	// Accepted: is the configuration valid. We only have errors in listeners, and the status is not supposed to
 	// be tied to listeners, so this is always accepted
 	// Programmed: is the data plane "ready" (note: eventually consistent)
-	gatewayConditions := map[string]*condition{
-		string(k8s.GatewayConditionAccepted): {
-			reason:  string(k8s.GatewayReasonAccepted),
-			message: "Resource accepted",
-		},
-		string(k8s.GatewayConditionProgrammed): {
-			reason:  string(k8s.GatewayReasonProgrammed),
-			message: "Resource programmed",
-		},
-	}
+	gatewayConditions := kstatus.NewGatewayConditionSet(
+		kstatus.GatewayAcceptedReason(k8s.GatewayReasonAccepted), "Resource accepted",
+		kstatus.GatewayProgrammedReason(k8s.GatewayReasonProgrammed), "Resource programmed",
+	)
 	if gatewayErr != nil {
-		gatewayConditions[string(k8s.GatewayConditionAccepted)].error = gatewayErr
+		gatewayConditions.SetAcceptedError(
+			kstatus.GatewayAcceptedReason(gatewayErr.Reason),
+			gatewayErr.Message,
+		)
 	}
 
 	if listenerSetCount != 0 {
 		gs.AttachedListenerSets = ptr.Of(int32(listenerSetCount))
 	}
 
-	setProgrammedCondition(gatewayConditions, internal, gatewayServices, warnings, allUsable)
+	setProgrammedCondition(&gatewayConditions, internal, gatewayServices, warnings, allUsable)
 
 	addressesToReport := external
 	if len(addressesToReport) == 0 {
@@ -1785,7 +1782,7 @@ func reportGatewayStatus(
 		}
 	}
 	gs.Listeners = listeners
-	gs.Conditions = setConditions(obj.Generation, gs.Conditions, gatewayConditions)
+	gs.Conditions = gatewayConditions.Build(obj.Generation, gs.Conditions)
 }
 
 func reportListenerSetStatus(
@@ -1804,40 +1801,36 @@ func reportListenerSetStatus(
 	// Accepted: is the configuration valid. We only have errors in listeners, and the status is not supposed to
 	// be tied to listeners, so this is always accepted
 	// Programmed: is the data plane "ready" (note: eventually consistent)
-	gatewayConditions := map[string]*condition{
-		string(k8s.GatewayConditionAccepted): {
-			reason:  string(k8s.GatewayReasonAccepted),
-			message: "Resource accepted",
-		},
-		string(k8s.GatewayConditionProgrammed): {
-			reason:  string(k8s.GatewayReasonProgrammed),
-			message: "Resource programmed",
-		},
-	}
+	gatewayConditions := kstatus.NewGatewayConditionSet(
+		kstatus.GatewayAcceptedReason(k8s.GatewayReasonAccepted), "Resource accepted",
+		kstatus.GatewayProgrammedReason(k8s.GatewayReasonProgrammed), "Resource programmed",
+	)
 	if gatewayErr != nil {
-		gatewayErr.Message = "Parent not accepted: " + gatewayErr.Message
-		gatewayConditions[string(k8s.GatewayConditionAccepted)].error = gatewayErr
+		gatewayConditions.SetAcceptedError(
+			kstatus.GatewayAcceptedReason(gatewayErr.Reason),
+			"Parent not accepted: "+gatewayErr.Message,
+		)
 	}
 
-	setProgrammedCondition(gatewayConditions, internal, gatewayServices, warnings, allUsable)
+	setProgrammedCondition(&gatewayConditions, internal, gatewayServices, warnings, allUsable)
 
-	gs.Conditions = setConditions(obj.Generation, gs.Conditions, gatewayConditions)
+	gs.Conditions = gatewayConditions.Build(obj.Generation, gs.Conditions)
 }
 
-func setProgrammedCondition(gatewayConditions map[string]*condition, internal []string, gatewayServices []string, warnings []string, allUsable bool) {
+func setProgrammedCondition(gatewayConditions *kstatus.GatewayConditionSet, internal []string, gatewayServices []string, warnings []string, allUsable bool) {
 	if len(internal) > 0 {
 		msg := fmt.Sprintf("Resource programmed, assigned to service(s) %s", humanReadableJoin(internal))
-		gatewayConditions[string(k8s.GatewayConditionProgrammed)].message = msg
+		gatewayConditions.SetProgrammedMessage(msg)
 	}
 
 	if len(gatewayServices) == 0 {
-		gatewayConditions[string(k8s.GatewayConditionProgrammed)].error = &ConfigError{
-			Reason:  InvalidAddress,
-			Message: "Failed to assign to any requested addresses",
-		}
+		gatewayConditions.SetProgrammedError(
+			kstatus.GatewayProgrammedReason(InvalidAddress),
+			"Failed to assign to any requested addresses",
+		)
 	} else if len(warnings) > 0 {
 		var msg string
-		var reason string
+		var reason kstatus.GatewayProgrammedReason
 		if len(internal) != 0 {
 			msg = fmt.Sprintf("Assigned to service(s) %s, but failed to assign to all requested addresses: %s",
 				humanReadableJoin(internal), strings.Join(warnings, "; "))
@@ -1845,15 +1838,12 @@ func setProgrammedCondition(gatewayConditions map[string]*condition, internal []
 			msg = fmt.Sprintf("Failed to assign to any requested addresses: %s", strings.Join(warnings, "; "))
 		}
 		if allUsable {
-			reason = string(k8s.GatewayReasonAddressNotAssigned)
+			reason = kstatus.GatewayProgrammedReason(k8s.GatewayReasonAddressNotAssigned)
 		} else {
-			reason = string(k8s.GatewayReasonAddressNotUsable)
+			reason = kstatus.GatewayProgrammedReason(k8s.GatewayReasonAddressNotUsable)
 		}
-		gatewayConditions[string(k8s.GatewayConditionProgrammed)].error = &ConfigError{
-			// TODO: this only checks Service ready, we should also check Deployment ready?
-			Reason:  reason,
-			Message: msg,
-		}
+		// TODO: this only checks Service ready, we should also check Deployment ready?
+		gatewayConditions.SetProgrammedError(reason, msg)
 	}
 }
 
@@ -1864,67 +1854,43 @@ func reportUnmanagedGatewayStatus(
 	status *k8s.GatewayStatus,
 	obj *k8s.Gateway,
 ) {
-	gatewayConditions := map[string]*condition{
-		string(k8s.GatewayConditionAccepted): {
-			reason:  string(k8s.GatewayReasonAccepted),
-			message: "Resource accepted",
-		},
-		string(k8s.GatewayConditionProgrammed): {
-			reason: string(k8s.GatewayReasonProgrammed),
-			// Set to true anyway since this is basically declaring it as valid
-			message: "This Gateway is remote; Istio will not program it",
-		},
-	}
+	gatewayConditions := kstatus.NewGatewayConditionSet(
+		kstatus.GatewayAcceptedReason(k8s.GatewayReasonAccepted), "Resource accepted",
+		// Set to true anyway since this is basically declaring it as valid
+		kstatus.GatewayProgrammedReason(k8s.GatewayReasonProgrammed), "This Gateway is remote; Istio will not program it",
+	)
 
 	status.Addresses = slices.Map(obj.Spec.Addresses, func(e k8s.GatewaySpecAddress) k8s.GatewayStatusAddress {
 		return k8s.GatewayStatusAddress(e)
 	})
 	status.Listeners = nil
-	status.Conditions = setConditions(obj.Generation, status.Conditions, gatewayConditions)
+	status.Conditions = gatewayConditions.Build(obj.Generation, status.Conditions)
 }
 
 // reportUnsupportedListenerSet reports a status message for a ListenerSet that is not supported
 func reportUnsupportedListenerSet(class string, status *k8s.ListenerSetStatus, obj *k8s.ListenerSet) {
-	gatewayConditions := map[string]*condition{
-		string(k8s.GatewayConditionAccepted): {
-			reason: string(k8s.GatewayReasonAccepted),
-			error: &ConfigError{
-				Reason:  string(k8s.ListenerSetReasonNotAllowed),
-				Message: fmt.Sprintf("The %q GatewayClass does not support ListenerSet", class),
-			},
-		},
-		string(k8s.GatewayConditionProgrammed): {
-			reason: string(k8s.GatewayReasonProgrammed),
-			error: &ConfigError{
-				Reason:  string(k8s.ListenerSetReasonNotAllowed),
-				Message: fmt.Sprintf("The %q GatewayClass does not support ListenerSet", class),
-			},
-		},
-	}
+	notAllowedMsg := fmt.Sprintf("The %q GatewayClass does not support ListenerSet", class)
+	gatewayConditions := kstatus.NewGatewayConditionSet(
+		kstatus.GatewayAcceptedReason(k8s.GatewayReasonAccepted), "",
+		kstatus.GatewayProgrammedReason(k8s.GatewayReasonProgrammed), "",
+	)
+	gatewayConditions.SetAcceptedError(kstatus.GatewayAcceptedReason(k8s.ListenerSetReasonNotAllowed), notAllowedMsg)
+	gatewayConditions.SetProgrammedError(kstatus.GatewayProgrammedReason(k8s.ListenerSetReasonNotAllowed), notAllowedMsg)
 	status.Listeners = nil
-	status.Conditions = setConditions(obj.Generation, status.Conditions, gatewayConditions)
+	status.Conditions = gatewayConditions.Build(obj.Generation, status.Conditions)
 }
 
 // reportNotAllowedListenerSet reports a status message for a ListenerSet that is not allowed to be selected
 func reportNotAllowedListenerSet(status *k8s.ListenerSetStatus, obj *k8s.ListenerSet) {
-	gatewayConditions := map[string]*condition{
-		string(k8s.GatewayConditionAccepted): {
-			reason: string(k8s.GatewayReasonAccepted),
-			error: &ConfigError{
-				Reason:  string(k8s.ListenerSetReasonNotAllowed),
-				Message: "The parent Gateway does not allow this reference; check the 'spec.allowedRoutes'",
-			},
-		},
-		string(k8s.GatewayConditionProgrammed): {
-			reason: string(k8s.GatewayReasonProgrammed),
-			error: &ConfigError{
-				Reason:  string(k8s.ListenerSetReasonNotAllowed),
-				Message: "The parent Gateway does not allow this reference; check the 'spec.allowedRoutes'",
-			},
-		},
-	}
+	notAllowedMsg := "The parent Gateway does not allow this reference; check the 'spec.allowedRoutes'"
+	gatewayConditions := kstatus.NewGatewayConditionSet(
+		kstatus.GatewayAcceptedReason(k8s.GatewayReasonAccepted), "",
+		kstatus.GatewayProgrammedReason(k8s.GatewayReasonProgrammed), "",
+	)
+	gatewayConditions.SetAcceptedError(kstatus.GatewayAcceptedReason(k8s.ListenerSetReasonNotAllowed), notAllowedMsg)
+	gatewayConditions.SetProgrammedError(kstatus.GatewayProgrammedReason(k8s.ListenerSetReasonNotAllowed), notAllowedMsg)
 	status.Listeners = nil
-	status.Conditions = setConditions(obj.Generation, status.Conditions, gatewayConditions)
+	status.Conditions = gatewayConditions.Build(obj.Generation, status.Conditions)
 }
 
 func extractGatewayServices(domainSuffix string, kgw *k8s.Gateway, info gatewaycommon.ClassInfo) ([]string, *ConfigError) {
@@ -1982,67 +1948,54 @@ func buildListener(
 	controllerName k8s.GatewayController,
 	portErr error,
 ) (*istio.Server, []k8s.ListenerStatus, bool) {
-	listenerConditions := map[string]*condition{
-		string(k8s.ListenerConditionAccepted): {
-			reason:  string(k8s.ListenerReasonAccepted),
-			message: "No errors found",
-		},
-		string(k8s.ListenerConditionProgrammed): {
-			reason:  string(k8s.ListenerReasonProgrammed),
-			message: "No errors found",
-		},
-		string(k8s.ListenerConditionConflicted): {
-			reason:  string(k8s.ListenerReasonNoConflicts),
-			message: "No errors found",
-			status:  kstatus.StatusFalse,
-		},
-		string(k8s.ListenerConditionResolvedRefs): {
-			reason:  string(k8s.ListenerReasonResolvedRefs),
-			message: "No errors found",
-		},
-	}
+	listenerConditions := kstatus.NewListenerConditionSet(
+		kstatus.ListenerAcceptedReason(k8s.ListenerReasonAccepted), "No errors found",
+		kstatus.ListenerProgrammedReason(k8s.ListenerReasonProgrammed), "No errors found",
+		kstatus.ListenerConflictedReason(k8s.ListenerReasonNoConflicts), "No errors found",
+		kstatus.ListenerResolvedRefsReason(k8s.ListenerReasonResolvedRefs), "No errors found",
+	)
 
 	ok := true
 	tls, err := buildTLS(ctx, configMaps, secrets, grants, resolveGatewayTLS(l.Port, gw.TLS), l.TLS, obj, kube.IsAutoPassthrough(obj.GetLabels(), l))
 	if err != nil {
-		listenerConditions[string(k8s.ListenerConditionResolvedRefs)].error = err
-		listenerConditions[string(k8s.GatewayConditionProgrammed)].error = &ConfigError{
-			Reason:  string(k8s.GatewayReasonInvalid),
-			Message: "Bad TLS configuration",
-		}
+		listenerConditions.SetResolvedRefsError(kstatus.ListenerResolvedRefsReason(err.Reason), err.Message)
+		listenerConditions.SetProgrammedError(
+			kstatus.ListenerProgrammedReason(k8s.GatewayReasonInvalid),
+			"Bad TLS configuration",
+		)
 		ok = false
 	}
 	hostnames := buildHostnameMatch(ctx, obj.GetNamespace(), namespaces, l)
 	if portErr != nil {
-		listenerConditions[string(k8s.ListenerConditionAccepted)].error = &ConfigError{
-			Reason:  string(k8s.ListenerReasonUnsupportedProtocol),
-			Message: portErr.Error(),
-		}
+		listenerConditions.SetAcceptedError(
+			kstatus.ListenerAcceptedReason(k8s.ListenerReasonUnsupportedProtocol),
+			portErr.Error(),
+		)
 		ok = false
 	}
 	protocol, perr := listenerProtocolToIstio(controllerName, l.Protocol)
 	if perr != nil {
-		listenerConditions[string(k8s.ListenerConditionAccepted)].error = &ConfigError{
-			Reason:  string(k8s.ListenerReasonUnsupportedProtocol),
-			Message: perr.Error(),
-		}
+		listenerConditions.SetAcceptedError(
+			kstatus.ListenerAcceptedReason(k8s.ListenerReasonUnsupportedProtocol),
+			perr.Error(),
+		)
 		ok = false
 	}
 	if controllerName == constants.ManagedGatewayMeshController {
 		if unexpectedWaypointListener(l) {
-			listenerConditions[string(k8s.ListenerConditionAccepted)].error = &ConfigError{
-				Reason:  string(k8s.ListenerReasonUnsupportedProtocol),
-				Message: `Expected a single listener on port 15008 with protocol "HBONE"`,
-			}
+			listenerConditions.SetAcceptedError(
+				kstatus.ListenerAcceptedReason(k8s.ListenerReasonUnsupportedProtocol),
+				`Expected a single listener on port 15008 with protocol "HBONE"`,
+			)
 		}
 	}
 
 	if controllerName == constants.ManagedGatewayEastWestController {
 		if unexpectedEastWestWaypointListener(l) {
-			listenerConditions[string(k8s.ListenerConditionAccepted)].error = &ConfigError{
-				Reason:  string(k8s.ListenerReasonUnsupportedProtocol),
-				Message: `East-west gateway listeners must be either port 15008 with protocol "HBONE" and TLS.Mode == Terminate, or TLS with TLS.Mode == Passthrough`,
-			}
+			listenerConditions.SetAcceptedError(
+				kstatus.ListenerAcceptedReason(k8s.ListenerReasonUnsupportedProtocol),
+				`East-west gateway listeners must be either port 15008 with protocol "HBONE" and TLS.Mode == Terminate, or TLS with TLS.Mode == Passthrough`,
+			)
 		}
 	}
 	server := &istio.Server{
@@ -2056,7 +2009,7 @@ func buildListener(
 		Tls:   tls,
 	}
 
-	updatedStatus := reportListenerCondition(listenerIndex, l, obj, status, listenerConditions)
+	updatedStatus := reportListenerCondition(listenerIndex, l, obj, status, &listenerConditions)
 	return server, updatedStatus, ok
 }
 
